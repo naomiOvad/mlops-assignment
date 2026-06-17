@@ -16,12 +16,16 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+
+load_dotenv()
 from langgraph.graph import END, START, StateGraph
 
 from agent import prompts
@@ -61,6 +65,7 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
 
@@ -111,6 +116,21 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
+def _parse_verify_json(text: str) -> tuple[bool, str]:
+    """Extract {"ok": bool, "issue": str} from model output."""
+    raw = text.strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
+    try:
+        data = json.loads(raw)
+        ok = bool(data.get("ok", False))
+        issue = str(data.get("issue") or "")
+        return ok, issue
+    except json.JSONDecodeError:
+        return False, f"Could not parse verifier JSON: {text[:200]}"
+
+
 def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
@@ -124,7 +144,37 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = state.execution
+    if execution is None:
+        issue = "No execution result"
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history + [{"node": "verify", "ok": False, "issue": issue}],
+        }
+    if not execution.ok:
+        issue = execution.error or "SQL execution failed"
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history + [{"node": "verify", "ok": False, "issue": issue}],
+        }
+
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution_result=execution.render(),
+        )),
+    ])
+    ok, issue = _parse_verify_json(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +187,24 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = state.execution
+    execution_result = execution.render() if execution else "No execution result"
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution_result=execution_result,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql, "issue": state.verify_issue}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +213,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
