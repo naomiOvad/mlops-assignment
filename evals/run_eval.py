@@ -54,11 +54,77 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
     return canonicalize(gold_rows) == canonicalize(pred_rows)
 
 
-# ---------- Implement these (Phase 5) ----------------------------------
+# Track pass rate after attempt 0..MAX_ITERATIONS (README: iter 0 vs iter 3).
+MAX_ITERATION_INDEX = 3
+
+
+def _sql_attempts(history: list[dict]) -> list[str]:
+    """Ordered SQL candidates from generate_sql / revise history entries."""
+    attempts: list[str] = []
+    for entry in history:
+        if entry.get("node") in ("generate_sql", "revise") and entry.get("sql"):
+            attempts.append(entry["sql"])
+    return attempts
+
+
+def _per_iteration_correct(
+    db_id: str, gold_rows: list[tuple] | None, attempts: list[str]
+) -> list[bool]:
+    """Execution-accuracy correctness for each SQL attempt."""
+    if gold_rows is None:
+        return [False] * len(attempts)
+    correct: list[bool] = []
+    for sql in attempts:
+        ok, rows, _ = run_sql(db_id, sql)
+        correct.append(matches(gold_rows, rows) if ok else False)
+    return correct
+
 
 def eval_one(question: dict, agent_url: str) -> dict:
     """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    db_id = question["db_id"]
+    gold_ok, gold_rows, gold_error = run_sql(db_id, question["gold_sql"])
+
+    payload = {
+        "question": question["question"],
+        "db": db_id,
+        "tags": {"run_type": "eval", "db_id": db_id},
+    }
+    try:
+        resp = httpx.post(agent_url, json=payload, timeout=300.0)
+        resp.raise_for_status()
+        agent = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "question": question["question"],
+            "db_id": db_id,
+            "gold_ok": gold_ok,
+            "gold_error": gold_error,
+            "agent_error": f"{type(e).__name__}: {e}",
+            "iterations": 0,
+            "final_correct": False,
+            "per_iteration_correct": [],
+        }
+
+    attempts = _sql_attempts(agent.get("history", []))
+    if not attempts and agent.get("sql"):
+        attempts = [agent["sql"]]
+
+    per_iter = _per_iteration_correct(db_id, gold_rows if gold_ok else None, attempts)
+    final_correct = bool(per_iter[-1]) if per_iter else False
+
+    return {
+        "question": question["question"],
+        "db_id": db_id,
+        "gold_ok": gold_ok,
+        "gold_error": gold_error,
+        "agent_ok": agent.get("ok"),
+        "agent_error": agent.get("error"),
+        "iterations": agent.get("iterations", 0),
+        "final_sql": agent.get("sql", ""),
+        "final_correct": final_correct,
+        "per_iteration_correct": per_iter,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +136,38 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {
+            "total": 0,
+            "final_correct": 0,
+            "pass_rate": 0.0,
+            "per_iteration_pass_rate": {},
+            "avg_iterations": 0.0,
+        }
+
+    final_correct = sum(1 for r in results if r.get("final_correct"))
+    avg_iterations = sum(r.get("iterations", 0) for r in results) / n
+
+    per_iteration_pass_rate: dict[str, float] = {}
+    for k in range(MAX_ITERATION_INDEX + 1):
+        correct_at_k = 0
+        for r in results:
+            per = r.get("per_iteration_correct") or []
+            if not per:
+                continue
+            idx = min(k, len(per) - 1)
+            if per[idx]:
+                correct_at_k += 1
+        per_iteration_pass_rate[str(k)] = correct_at_k / n
+
+    return {
+        "total": n,
+        "final_correct": final_correct,
+        "pass_rate": final_correct / n,
+        "per_iteration_pass_rate": per_iteration_pass_rate,
+        "avg_iterations": avg_iterations,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
