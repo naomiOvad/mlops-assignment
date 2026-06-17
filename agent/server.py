@@ -23,9 +23,12 @@ from agent.graph import AgentState, graph  # noqa: E402
 # are NOT swallowed - a misconfigured Langfuse should not silently
 # produce zero traces.
 _lf_handler: Any = None
+_lf_client: Any = None
 if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+    from langfuse import get_client
     from langfuse.langchain import CallbackHandler
 
+    _lf_client = get_client()
     _lf_handler = CallbackHandler()
 
 
@@ -52,17 +55,39 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _langfuse_config(tags: dict[str, str], db: str) -> dict[str, Any]:
+    """Build LangGraph config with Langfuse trace tags + metadata.
+
+    Langfuse shows key/value pairs in the Metadata column. The Tags column
+    only fills when ``langfuse_tags`` (a list of strings) is present.
+    """
+    metadata = dict(tags)
+    if "db_id" not in metadata:
+        metadata["db_id"] = db
+    model = os.environ.get("VLLM_MODEL", "")
+    if model and "model" not in metadata:
+        metadata["model"] = model
+
+    return {
+        "callbacks": [_lf_handler] if _lf_handler is not None else [],
+        "metadata": {
+            **metadata,
+            "langfuse_tags": [f"{k}:{v}" for k, v in metadata.items()],
+        },
+    }
+
+
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
-    config: dict[str, Any] = {
-        "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
-    }
+    config = _langfuse_config(req.tags, req.db)
     try:
         final = graph.invoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    finally:
+        if _lf_client is not None:
+            _lf_client.flush()
 
     sql = final.get("sql", "")
     iteration = final.get("iteration", 0)
